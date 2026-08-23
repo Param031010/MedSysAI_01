@@ -24,12 +24,16 @@ class GraphNode(BaseModel):
     id: str
     label: str
     date: str
+    description: str | None = None
+    category: str | None = None
 
 
 class GraphEdge(BaseModel):
     source: str
     target: str
     durationDays: int
+    relation: str | None = None
+    rationale: str | None = None
 
 
 class KnowledgeGraph(BaseModel):
@@ -42,7 +46,7 @@ class HomeSnapshot(BaseModel):
     statusNote: str
     environment: EnvironmentSnapshot
     tip: str
-    generalTip: str
+    generalTip: str | None = None
     graph: KnowledgeGraph
 
 
@@ -87,7 +91,7 @@ class ChatMessageIn(BaseModel):
 
 
 class ModelStatus(BaseModel):
-    provider: Literal["ollama", "groq"]
+    provider: Literal["ollama", "groq", "gemini"]
     model: str
     reachable: bool
 

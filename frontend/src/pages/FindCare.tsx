@@ -26,11 +26,15 @@ export default function FindCare() {
   useEffect(() => {
     let active = true;
     setLoadError(false);
-    getFacilities()
+    getFacilities({
+      lat: userLocation?.lat,
+      lng: userLocation?.lng,
+      radiusKm: radius ?? undefined,
+    })
       .then((list) => {
         if (!active) return;
         setFacilities(list);
-        setSelectedId(list[0]?.id ?? null);
+        setSelectedId((prev) => (prev && list.some((f) => f.id === prev) ? prev : list[0]?.id ?? null));
       })
       .catch(() => {
         if (active) setLoadError(true);
@@ -38,7 +42,8 @@ export default function FindCare() {
     return () => {
       active = false;
     };
-  }, [retryKey]);
+  }, [retryKey, userLocation, radius]);
+
 
   const specialties = useMemo(
     () => Array.from(new Set(facilities.map((f) => f.specialty))),

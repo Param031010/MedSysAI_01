@@ -1,4 +1,6 @@
-"""Local embeddings via sentence-transformers — runs in-process, no server."""
+import os
+os.environ["USE_TF"] = "0"
+os.environ["USE_TORCH"] = "1"
 
 from sentence_transformers import SentenceTransformer
 

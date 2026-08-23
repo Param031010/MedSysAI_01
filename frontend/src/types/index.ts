@@ -21,12 +21,16 @@ export interface GraphNode {
   id: string;
   label: string;
   date: string;
+  description?: string;
+  category?: string;
 }
 
 export interface GraphEdge {
   source: string;
   target: string;
   durationDays: number;
+  relation?: string;
+  rationale?: string;
 }
 
 export interface KnowledgeGraph {
@@ -79,7 +83,7 @@ export interface ChatMessage {
 }
 
 export interface ModelStatus {
-  provider: "ollama" | "groq";
+  provider: "ollama" | "groq" | "gemini";
   model: string;
   reachable: boolean;
 }

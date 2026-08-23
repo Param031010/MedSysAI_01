@@ -9,12 +9,13 @@ import { setAuthTokenGetter } from "@/services/client";
  * changes, letting every `apiFetch`/`apiUpload` call attach a fresh token.
  */
 export function AuthTokenBridge() {
-  const { getToken, isSignedIn } = useAuth();
+  const { getToken, isSignedIn, isLoaded } = useAuth();
 
   useEffect(() => {
-    setAuthTokenGetter(isSignedIn ? () => getToken() : null);
-    return () => setAuthTokenGetter(null);
-  }, [getToken, isSignedIn]);
+    if (isLoaded) {
+      setAuthTokenGetter(isSignedIn ? () => getToken() : null);
+    }
+  }, [getToken, isSignedIn, isLoaded]);
 
   return null;
 }

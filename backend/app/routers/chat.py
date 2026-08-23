@@ -2,7 +2,7 @@ import asyncio
 from datetime import datetime, timezone
 
 import httpx
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
 from app.config import settings
 from app.db import get_db
@@ -14,7 +14,8 @@ from app.models import (
     ChatSessionSourcesIn,
     ChatSource,
 )
-from app.services import model_router, rag, supermemory_client, web_search
+from app.services import model_router, rag, supermemory_client, weather, web_search
+from app.services.clerk_auth import require_clerk_auth
 from app.services.mock_data import CHAT_SOURCES
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -74,7 +75,9 @@ def get_session_messages(session_id: str) -> list[dict]:
 
 
 @router.post("/sessions/{session_id}/messages", response_model=ChatMessage)
-async def post_session_message(session_id: str, body: ChatMessageIn) -> dict:
+async def post_session_message(
+    session_id: str, body: ChatMessageIn, user_id: str = Depends(require_clerk_auth)
+) -> dict:
     db = get_db()
     session = db.chat_sessions.find_one({"id": session_id})
     if not session:
@@ -101,10 +104,6 @@ async def post_session_message(session_id: str, body: ChatMessageIn) -> dict:
     if search_query:
         web_sources = await web_search.deep_search(search_query)
 
-    # Grounding is scoped to this conversation: its own history, whichever My
-    # Data cards the user selected for this session, and anything just
-    # scraped by a web search — never someone else's session or an
-    # unselected document.
     web_source_ids = [f"web:{w['url']}" for w in web_sources]
     allowed_source_ids = [
         f"chat:{session_id}",
@@ -117,16 +116,60 @@ async def post_session_message(session_id: str, body: ChatMessageIn) -> dict:
         )
 
     context_chunks = rag.retrieve(body.content, top_k=8, allowed_source_ids=allowed_source_ids)
-    prompt = body.content
+
+    # Concurrently fetch user profile & environment snapshot for Priority 1 grounding
+    profile_task = asyncio.to_thread(db.profiles.find_one, {"clerkUserId": user_id}, {"_id": 0})
+    weather_task = weather.get_environment_snapshot()
+    user_profile, env_snapshot = await asyncio.gather(profile_task, weather_task)
+
+    context_parts: list[str] = []
+
+    if user_profile:
+        conditions_str = ", ".join(user_profile.get("conditions", [])) or "None listed"
+        meds = user_profile.get("medications", [])
+        meds_str = (
+            ", ".join(
+                f"{m['name']} ({m['dosage']})" if m.get("dosage") else m["name"]
+                for m in meds
+                if isinstance(m, dict) and m.get("name")
+            )
+            or "None listed"
+        )
+        context_parts.append(
+            f"[PATIENT PROFILE]\n"
+            f"Name: {user_profile.get('fullName', 'Patient')}\n"
+            f"Age: {user_profile.get('age', 'N/A')}, BMI: {user_profile.get('bmi', 'N/A')}, Blood Group: {user_profile.get('bloodGroup', 'N/A')}\n"
+            f"Active Conditions: {conditions_str}\n"
+            f"Current Medications: {meds_str}"
+        )
+
+    if env_snapshot:
+        pollutants_str = ", ".join(
+            f"{p['label']}: {p['value']} {p['unit']}"
+            for p in env_snapshot.get("pollutants", [])
+        )
+        context_parts.append(
+            f"[LIVE LOCAL ENVIRONMENT & AQI]\n"
+            f"Location: {env_snapshot.get('locationName', 'Unknown')}\n"
+            f"Temperature: {env_snapshot.get('tempC')}°C, Weather: {env_snapshot.get('condition')}\n"
+            f"AQI: {env_snapshot.get('aqi')} ({env_snapshot.get('aqiCategory')})\n"
+            f"Pollutants: {pollutants_str}"
+        )
+
     if context_chunks:
         context_text = "\n\n".join(chunk["text"] for chunk in context_chunks)
+        context_parts.append(f"[MEDICAL RECORDS & CONVERSATION EXCERPTS]\n{context_text}")
+
+    prompt = body.content
+    if context_parts:
+        context_block = "\n\n".join(context_parts)
         prompt = (
-            "Use the following excerpts from the user's selected medical "
-            "records, past conversation, and any web search results to "
-            "ground your answer. If none are relevant, answer normally and "
-            "say so.\n\n"
-            f"{context_text}\n\nQuestion: {body.content}"
+            "Use the following patient profile, live environmental intelligence, and medical record/history excerpts "
+            "to ground your answer. If environmental factors (e.g. high PM2.5 or humidity) or patient active conditions/medications "
+            "are relevant to the user's question, incorporate personalized guidance naturally.\n\n"
+            f"{context_block}\n\nQuestion: {body.content}"
         )
+
     # Extracting entities runs alongside reply generation (not after it) so
     # the knowledge graph and Profile history/medications build themselves
     # as you chat without adding latency to the reply you're actually

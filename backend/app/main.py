@@ -19,10 +19,22 @@ app.add_middleware(
 # Every other router requires a valid Clerk session JWT.
 auth_dep = [Depends(require_clerk_auth)]
 
+@app.get("/")
+def root():
+    return {
+        "message": "MedSys AI FastAPI Backend is running",
+        "docs": "/docs",
+        "health": "/health",
+        "frontend": "http://localhost:5173",
+    }
+
+
 app.include_router(health.router)
+app.include_router(facilities.router)
 app.include_router(home.router, dependencies=auth_dep)
 app.include_router(chat.router, dependencies=auth_dep)
-app.include_router(facilities.router, dependencies=auth_dep)
 app.include_router(profile.router, dependencies=auth_dep)
 app.include_router(symptoms.router, dependencies=auth_dep)
 app.include_router(mydata.router, dependencies=auth_dep)
+
+

@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from app.db import get_db
 from app.models import ProfileIn, ProfileRecord
 from app.services import model_router, supermemory_client
+from app.services.mock_data import DEFAULT_PROFILE
 from app.services.clerk_auth import require_clerk_auth
 
 router = APIRouter(prefix="/profile", tags=["profile"])
@@ -38,7 +39,7 @@ async def get_profile(user_id: str = Depends(require_clerk_auth)) -> dict:
     db = get_db()
     profile = db.profiles.find_one({"clerkUserId": user_id}, {"_id": 0, "clerkUserId": 0})
     if not profile:
-        raise HTTPException(status_code=404, detail="No profile on record yet")
+        profile = dict(DEFAULT_PROFILE)
 
     sources = list(
         db.sources.find(

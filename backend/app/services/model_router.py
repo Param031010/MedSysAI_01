@@ -46,83 +46,169 @@ WEB_SEARCH_TOOL = {
 
 
 def active_provider() -> tuple[str, str]:
-    """Returns (provider, model) for whichever backend is currently selected."""
+    """Returns (provider, model) for whichever chat backend is currently selected (Ollama local or Groq cloud)."""
     if settings.ollama_model:
         return "ollama", settings.ollama_model
     return "groq", settings.groq_model
-
-
 async def check_reachable() -> bool:
-    provider, _ = active_provider()
     try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            if provider == "ollama":
-                res = await client.get(f"{settings.ollama_host}/api/tags")
-            else:
-                res = await client.get(
-                    "https://api.groq.com/openai/v1/models",
-                    headers={"Authorization": f"Bearer {settings.groq_api_key}"},
-                )
-            return res.status_code == 200
-    except httpx.HTTPError:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            if settings.ollama_model:
+                try:
+                    res = await client.get(f"{settings.ollama_host}/api/tags", timeout=0.5)
+                    if res.status_code == 200:
+                        return True
+                except (httpx.HTTPError, Exception):
+                    pass
+            if settings.groq_api_key:
+                try:
+                    res = await client.get(
+                        "https://api.groq.com/openai/v1/models",
+                        headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+                        timeout=2.0,
+                    )
+                    if res.status_code == 200:
+                        return True
+                except (httpx.HTTPError, Exception):
+                    pass
+            if settings.gemini_api_key:
+                try:
+                    res = await client.get(
+                        f"https://generativelanguage.googleapis.com/v1beta/models/{settings.gemini_model}?key={settings.gemini_api_key}",
+                        timeout=2.0,
+                    )
+                    return res.status_code == 200
+                except (httpx.HTTPError, Exception):
+                    pass
+            return False
+    except Exception:
         return False
+
+
+
+async def complete_gemini(
+    user: str,
+    system: str | None = None,
+    max_tokens: int | None = None,
+    timeout: float = 25.0,
+    temperature: float | None = None,
+) -> str:
+    """Uses Google Gemini (gemini-2.5-flash) directly with Groq fallback if Gemini hits rate limits."""
+    if settings.gemini_api_key:
+        try:
+            full_prompt = f"{system}\n\n{user}" if system else user
+            gen_config: dict = {}
+            if max_tokens:
+                gen_config["maxOutputTokens"] = max_tokens
+            if temperature is not None:
+                gen_config["temperature"] = temperature
+            payload = {
+                "contents": [{"parts": [{"text": full_prompt}]}],
+                **({"generationConfig": gen_config} if gen_config else {}),
+            }
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                res = await client.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{settings.gemini_model}:generateContent?key={settings.gemini_api_key}",
+                    json=payload,
+                )
+                if res.status_code == 200:
+                    text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+                    return _SPECIAL_TOKEN.sub("", text).strip()
+        except Exception:
+            pass
+
+    # Direct Groq fallback (non-recursive)
+    if settings.groq_api_key:
+        messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": user}]
+        try:
+            async with httpx.AsyncClient(timeout=min(timeout, 4.0)) as client:
+                res = await client.post(
+                    GROQ_CHAT_URL,
+                    headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+                    json={"model": settings.groq_model, "messages": messages, **({"max_tokens": max_tokens} if max_tokens else {})},
+                )
+                if res.status_code == 200:
+                    return res.json()["choices"][0]["message"]["content"].strip()
+        except Exception:
+            pass
+
+    raise RuntimeError("Gemini and Groq backends unavailable.")
 
 
 async def _complete(
     user: str,
     system: str | None = None,
     max_tokens: int | None = None,
-    timeout: float = 60.0,
+    timeout: float = 30.0,
     temperature: float | None = None,
 ) -> str:
-    """Runs a single-turn completion against whichever text backend is
-    active — a local Ollama model if OLLAMA_MODEL is set, else Groq."""
-    provider, model = active_provider()
+    """Tries local Ollama, falling back to Groq Cloud or Gemini Cloud on any connection error."""
     messages = ([{"role": "system", "content": system}] if system else []) + [
         {"role": "user", "content": user}
     ]
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        if provider == "ollama":
-            ollama_payload: dict = {
-                "model": model,
-                "messages": messages,
-                "stream": False,
-                # Ollama unloads an idle model after 5 minutes by
-                # default, and reloading it costs several extra seconds
-                # on the next request — keep it resident longer so
-                # normal browsing gaps don't repeatedly pay that cost.
-                "keep_alive": "30m",
-            }
-            options: dict = {}
-            if max_tokens:
-                # Without a cap this local model will ramble well past a
-                # short answer before it naturally stops — costing many
-                # extra seconds for no benefit — so cap it the same way
-                # the Groq branch below already does via `max_tokens`.
-                options["num_predict"] = max_tokens
-            if temperature is not None:
-                options["temperature"] = temperature
-            if options:
-                ollama_payload["options"] = options
-            res = await client.post(
-                f"{settings.ollama_host}/api/chat",
-                json=ollama_payload,
-            )
-            res.raise_for_status()
-            return _SPECIAL_TOKEN.sub("", res.json()["message"]["content"]).strip()
 
-        payload: dict = {"model": model, "messages": messages}
-        if max_tokens:
-            payload["max_tokens"] = max_tokens
-        if temperature is not None:
-            payload["temperature"] = temperature
-        res = await client.post(
-            GROQ_CHAT_URL,
-            headers={"Authorization": f"Bearer {settings.groq_api_key}"},
-            json=payload,
-        )
-        res.raise_for_status()
-        return res.json()["choices"][0]["message"]["content"].strip()
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        # 1. Try local Ollama if configured
+        if settings.ollama_model:
+            try:
+                ollama_payload: dict = {
+                    "model": settings.ollama_model,
+                    "messages": messages,
+                    "stream": False,
+                    "keep_alive": "30m",
+                }
+                options: dict = {}
+                if max_tokens:
+                    options["num_predict"] = max_tokens
+                if temperature is not None:
+                    options["temperature"] = temperature
+                if options:
+                    ollama_payload["options"] = options
+                res = await client.post(
+                    f"{settings.ollama_host}/api/chat",
+                    json=ollama_payload,
+                    timeout=1.5,
+                )
+                res.raise_for_status()
+                return _SPECIAL_TOKEN.sub("", res.json()["message"]["content"]).strip()
+            except (httpx.HTTPError, Exception):
+                pass  # Fallback to Groq / Gemini below
+
+        # 2. Try Groq Cloud if API key is present
+        if settings.groq_api_key:
+            try:
+                payload: dict = {"model": settings.groq_model, "messages": messages}
+                if max_tokens:
+                    payload["max_tokens"] = max_tokens
+                if temperature is not None:
+                    payload["temperature"] = temperature
+                res = await client.post(
+                    GROQ_CHAT_URL,
+                    headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+                    json=payload,
+                    timeout=min(timeout, 4.0),
+                )
+                res.raise_for_status()
+                return res.json()["choices"][0]["message"]["content"].strip()
+            except (httpx.HTTPError, Exception):
+                pass  # Fallback to Gemini below
+
+        # 3. Fallback to Gemini Cloud directly without calling complete_gemini recursively
+        if settings.gemini_api_key:
+            full_prompt = f"{system}\n\n{user}" if system else user
+            payload = {"contents": [{"parts": [{"text": full_prompt}]}]}
+            res = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{settings.gemini_model}:generateContent?key={settings.gemini_api_key}",
+                json=payload,
+                timeout=min(timeout, 4.0),
+            )
+            if res.status_code == 200:
+                text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+                return _SPECIAL_TOKEN.sub("", text).strip()
+
+        raise RuntimeError("No LLM backend (Ollama, Groq, or Gemini) is reachable.")
+
+
 
 
 async def decide_web_search(user_message: str) -> str | None:
@@ -396,23 +482,38 @@ GENERAL_TIP_SYSTEM_PROMPT = (
 
 
 async def generate_general_tip() -> str:
-    """A short, general wellness tip — regenerated fresh on every Home load,
-    not tied to weather/AQI or any of the user's own data."""
-    provider, _ = active_provider()
-    if provider == "groq" and not settings.groq_api_key:
-        return GENERAL_TIP_FALLBACK
-
+    """A short, general wellness tip — regenerated fresh on every Home load using Groq (or Ollama), with Gemini fallback."""
     theme = random.choice(GENERAL_TIP_THEMES)
     try:
         content = await _complete(
             f"Topic: {theme}",
             system=GENERAL_TIP_SYSTEM_PROMPT,
-            max_tokens=100,
-            timeout=15.0,
+            max_tokens=80,
+            timeout=1.5,
         )
-        return content or GENERAL_TIP_FALLBACK
-    except (httpx.HTTPError, KeyError, IndexError):
-        return GENERAL_TIP_FALLBACK
+        if content and "OLLAMA_MODEL" not in content and "GROQ_API_KEY" not in content:
+            return content
+    except Exception:
+        pass
+
+    try:
+        if settings.gemini_api_key:
+            return await complete_gemini(
+                f"Topic: {theme}",
+                system=GENERAL_TIP_SYSTEM_PROMPT,
+                max_tokens=80,
+                timeout=1.5,
+            )
+    except Exception:
+        pass
+
+    fallback_tips = [
+        "Prioritize 7 to 9 hours of restorative sleep each night to support your immune system and cognitive focus.",
+        "Aim for at least 150 minutes of moderate aerobic activity weekly to support cardiovascular health.",
+        "Stay hydrated throughout the day by drinking water regularly, especially during mental work or exercise.",
+        "Take short 5-minute movement breaks every hour to reduce musculoskeletal strain and boost circulation.",
+    ]
+    return random.choice(fallback_tips)
 
 
 async def generate_reply(message: str) -> str:

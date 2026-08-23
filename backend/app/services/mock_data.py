@@ -124,3 +124,19 @@ FACILITIES = [
         "phone": None,
     },
 ]
+
+DEFAULT_PROFILE = {
+    "fullName": "Patient",
+    "age": 30,
+    "gender": "prefer_not_to_say",
+    "heightCm": 170,
+    "weightKg": 70,
+    "bmi": 24.2,
+    "bloodGroup": "O+",
+    "allergies": [],
+    "conditions": [],
+    "medications": [],
+    "emergencyContact": {"name": "", "relation": "", "phone": ""},
+    "vitalsGoal": {"systolic": 120, "diastolic": 80, "restingHeartRateBpm": 72, "glucoseMgDl": 100},
+}
+

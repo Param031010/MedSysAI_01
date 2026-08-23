@@ -95,7 +95,7 @@ async def get_environment_snapshot() -> dict | None:
         "appid": settings.openweather_api_key,
     }
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
+        async with httpx.AsyncClient(timeout=1.5) as client:
             weather_res = await client.get(
                 f"{OWM_BASE}/weather", params={**params, "units": "metric"}
             )

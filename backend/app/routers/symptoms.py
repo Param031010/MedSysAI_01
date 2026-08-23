@@ -1,8 +1,7 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from pydantic import BaseModel
 
-from app.config import settings
-from app.services import supermemory_client
+from app.services import ai_graph_builder, supermemory_client
 
 router = APIRouter(prefix="/symptoms", tags=["symptoms"])
 
@@ -12,12 +11,21 @@ class SymptomIn(BaseModel):
     date: str
 
 
+@router.get("")
+async def list_symptoms() -> list[dict]:
+    return await supermemory_client.list_all_symptoms()
+
+
 @router.post("")
 async def log_symptom(body: SymptomIn) -> dict:
-    if not settings.supermemory_api_key:
-        raise HTTPException(
-            status_code=503,
-            detail="SUPERMEMORY_API_KEY is not configured — the knowledge graph is offline.",
-        )
     await supermemory_client.log_symptom(body.name, body.date)
+    await ai_graph_builder.compute_and_store_symptom_knowledge(body.name)
     return {"status": "logged"}
+
+
+@router.delete("/{name}")
+async def delete_symptom(name: str) -> dict:
+    await supermemory_client.delete_symptom(name)
+    await ai_graph_builder.delete_symptom_knowledge(name)
+    return {"status": "deleted"}
+

@@ -12,6 +12,7 @@ from datetime import datetime
 import httpx
 
 from app.config import settings
+from app.db import get_db
 
 SUPERMEMORY_BASE = "https://api.supermemory.ai"
 
@@ -29,6 +30,14 @@ def _format_date(iso_date: str) -> str:
 
 
 async def log_symptom(name: str, occurred_on: str) -> None:
+    db = get_db()
+    db.symptoms.update_one(
+        {"name": name.strip().lower()},
+        {"$set": {"name": name.strip(), "date": occurred_on, "loggedAt": datetime.now().isoformat()}},
+        upsert=True,
+    )
+    if not settings.supermemory_api_key:
+        return
     payload = {
         "memories": [
             {
@@ -44,6 +53,13 @@ async def log_symptom(name: str, occurred_on: str) -> None:
             f"{SUPERMEMORY_BASE}/v4/memories", headers=_headers(), json=payload
         )
         res.raise_for_status()
+
+
+async def delete_symptom(name: str) -> None:
+    db = get_db()
+    db.symptoms.delete_many({"name": {"$regex": f"^{name.strip()}$", "$options": "i"}})
+
+
 
 
 async def log_medication(name: str, dosage: str, occurred_on: str) -> None:
@@ -141,31 +157,29 @@ async def log_chat_message(session_id: str, role: str, content: str) -> None:
 async def list_all_symptoms() -> list[dict]:
     """Returns every distinct symptom/condition ever logged, one entry per
     distinct name with its most recent occurrence date."""
+    db = get_db()
+    local_symptoms = list(db.symptoms.find({}, {"_id": 0}))
+
     if not settings.supermemory_api_key:
-        return []
+        return local_symptoms
+
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            # log_symptom's content always literally contains the word
-            # "symptom", so this reliably surfaces every logged symptom —
-            # filtering by metadata.type server-side turned out not to
-            # match here, so the type check is done client-side below
-            # instead, which is more robust anyway.
+        async with httpx.AsyncClient(timeout=0.5) as client:
             res = await client.post(
                 f"{SUPERMEMORY_BASE}/v4/search",
                 headers=_headers(),
                 json={
                     "q": "symptom",
                     "containerTag": settings.supermemory_container_tag,
-                    # Supermemory caps this at 100 — a higher value 400s.
                     "limit": 100,
                 },
             )
             res.raise_for_status()
             results = res.json().get("results", [])
     except httpx.HTTPError:
-        return []
+        return local_symptoms
 
-    latest_by_name: dict[str, str] = {}
+    latest_by_name: dict[str, str] = {s["name"].lower(): s["date"] for s in local_symptoms if "name" in s and "date" in s}
     for r in results:
         meta = r.get("metadata")
         if not isinstance(meta, dict) or meta.get("type") != "symptom":
@@ -174,9 +188,11 @@ async def list_all_symptoms() -> list[dict]:
         date = meta.get("date")
         if not name or not date:
             continue
-        if name not in latest_by_name or date > latest_by_name[name]:
-            latest_by_name[name] = date
+        key = name.lower()
+        if key not in latest_by_name or date > latest_by_name[key]:
+            latest_by_name[key] = date
     return [{"name": name, "date": date} for name, date in latest_by_name.items()]
+
 
 
 async def list_all_medications() -> list[dict]:

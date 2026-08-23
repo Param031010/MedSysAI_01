@@ -56,6 +56,11 @@ class Settings:
         os.getenv("CLERK_PUBLISHABLE_KEY", "")
     )
 
+    tomtom_api_key: str = os.getenv("TOMTOM_API_KEY", "")
+    gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
+    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+
     cors_origins: list[str] = [
         origin.strip()
         for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
