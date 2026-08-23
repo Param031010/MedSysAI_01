@@ -8,6 +8,7 @@ import asyncio
 import json
 import random
 import re
+import time
 
 import httpx
 
@@ -106,7 +107,7 @@ async def complete_gemini(
                 "contents": [{"parts": [{"text": full_prompt}]}],
                 **({"generationConfig": gen_config} if gen_config else {}),
             }
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with httpx.AsyncClient(timeout=min(timeout, 12.0)) as client:
                 res = await client.post(
                     f"https://generativelanguage.googleapis.com/v1beta/models/{settings.gemini_model}:generateContent?key={settings.gemini_api_key}",
                     json=payload,
@@ -117,22 +118,30 @@ async def complete_gemini(
         except Exception:
             pass
 
-    # Direct Groq fallback (non-recursive)
+    # Direct Groq fallback with multi-model fallback (non-recursive)
     if settings.groq_api_key:
         messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": user}]
-        try:
-            async with httpx.AsyncClient(timeout=min(timeout, 4.0)) as client:
-                res = await client.post(
-                    GROQ_CHAT_URL,
-                    headers={"Authorization": f"Bearer {settings.groq_api_key}"},
-                    json={"model": settings.groq_model, "messages": messages, **({"max_tokens": max_tokens} if max_tokens else {})},
-                )
-                if res.status_code == 200:
-                    return res.json()["choices"][0]["message"]["content"].strip()
-        except Exception:
-            pass
+        models_to_try = [settings.groq_model, "qwen/qwen3.6-27b", "openai/gpt-oss-120b"]
+        for attempt in range(2):
+            for g_model in models_to_try:
+                try:
+                    async with httpx.AsyncClient(timeout=min(timeout, 12.0)) as client:
+                        res = await client.post(
+                            GROQ_CHAT_URL,
+                            headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+                            json={"model": g_model, "messages": messages, **({"max_tokens": max_tokens} if max_tokens else {})},
+                        )
+                        if res.status_code == 200:
+                            text = res.json()["choices"][0]["message"]["content"].strip()
+                            cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+                            return _SPECIAL_TOKEN.sub("", cleaned).strip()
+                        elif res.status_code == 429:
+                            await asyncio.sleep(1.5)
+                except Exception:
+                    pass
 
     raise RuntimeError("Gemini and Groq backends unavailable.")
+
 
 
 async def _complete(
@@ -170,28 +179,34 @@ async def _complete(
                     timeout=1.5,
                 )
                 res.raise_for_status()
-                return _SPECIAL_TOKEN.sub("", res.json()["message"]["content"]).strip()
+                text = res.json()["message"]["content"]
+                cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+                return _SPECIAL_TOKEN.sub("", cleaned).strip()
             except (httpx.HTTPError, Exception):
                 pass  # Fallback to Groq / Gemini below
 
-        # 2. Try Groq Cloud if API key is present
+        # 2. Try Groq Cloud models if API key is present
         if settings.groq_api_key:
-            try:
-                payload: dict = {"model": settings.groq_model, "messages": messages}
-                if max_tokens:
-                    payload["max_tokens"] = max_tokens
-                if temperature is not None:
-                    payload["temperature"] = temperature
-                res = await client.post(
-                    GROQ_CHAT_URL,
-                    headers={"Authorization": f"Bearer {settings.groq_api_key}"},
-                    json=payload,
-                    timeout=min(timeout, 4.0),
-                )
-                res.raise_for_status()
-                return res.json()["choices"][0]["message"]["content"].strip()
-            except (httpx.HTTPError, Exception):
-                pass  # Fallback to Gemini below
+            models_to_try = [settings.groq_model, "qwen/qwen3.6-27b", "openai/gpt-oss-120b"]
+            for g_model in models_to_try:
+                try:
+                    payload: dict = {"model": g_model, "messages": messages}
+                    if max_tokens:
+                        payload["max_tokens"] = max_tokens
+                    if temperature is not None:
+                        payload["temperature"] = temperature
+                    res = await client.post(
+                        GROQ_CHAT_URL,
+                        headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+                        json=payload,
+                        timeout=min(timeout, 12.0),
+                    )
+                    if res.status_code == 200:
+                        text = res.json()["choices"][0]["message"]["content"].strip()
+                        cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+                        return _SPECIAL_TOKEN.sub("", cleaned).strip()
+                except (httpx.HTTPError, Exception):
+                    pass
 
         # 3. Fallback to Gemini Cloud directly without calling complete_gemini recursively
         if settings.gemini_api_key:
@@ -481,49 +496,45 @@ GENERAL_TIP_SYSTEM_PROMPT = (
 )
 
 
+_CACHED_TIP: tuple[str, float] | None = None
+
 async def generate_general_tip() -> str:
-    """A short, general wellness tip — regenerated fresh on every Home load using Groq (or Ollama), with Gemini fallback."""
+    """A short, general wellness tip — cached in memory for 5 minutes for instant zero-latency response."""
+    global _CACHED_TIP
+    now = time.time()
+    if _CACHED_TIP and (now - _CACHED_TIP[1]) < 300.0:
+        return _CACHED_TIP[0]
+
     theme = random.choice(GENERAL_TIP_THEMES)
+    tip = None
     try:
-        content = await _complete(
+        tip = await complete_gemini(
             f"Topic: {theme}",
             system=GENERAL_TIP_SYSTEM_PROMPT,
             max_tokens=80,
             timeout=1.5,
         )
-        if content and "OLLAMA_MODEL" not in content and "GROQ_API_KEY" not in content:
-            return content
     except Exception:
         pass
 
+    if not tip or "OLLAMA_MODEL" in tip or "GROQ_API_KEY" in tip:
+        fallback_tips = [
+            "Prioritize 7 to 9 hours of restorative sleep each night to support your immune system and cognitive focus.",
+            "Aim for at least 150 minutes of moderate aerobic activity weekly to support cardiovascular health.",
+            "Stay hydrated throughout the day by drinking water regularly, especially during mental work or exercise.",
+            "Take short 5-minute movement breaks every hour to reduce musculoskeletal strain and boost circulation.",
+        ]
+        tip = random.choice(fallback_tips)
+
+    _CACHED_TIP = (tip, now)
+    return tip
+
+
+async def generate_reply(message: str, system: str | None = None) -> str:
     try:
-        if settings.gemini_api_key:
-            return await complete_gemini(
-                f"Topic: {theme}",
-                system=GENERAL_TIP_SYSTEM_PROMPT,
-                max_tokens=80,
-                timeout=1.5,
-            )
-    except Exception:
-        pass
-
-    fallback_tips = [
-        "Prioritize 7 to 9 hours of restorative sleep each night to support your immune system and cognitive focus.",
-        "Aim for at least 150 minutes of moderate aerobic activity weekly to support cardiovascular health.",
-        "Stay hydrated throughout the day by drinking water regularly, especially during mental work or exercise.",
-        "Take short 5-minute movement breaks every hour to reduce musculoskeletal strain and boost circulation.",
-    ]
-    return random.choice(fallback_tips)
-
-
-async def generate_reply(message: str) -> str:
-    try:
-        return await _complete(message, timeout=30.0)
-    except (httpx.HTTPError, KeyError, IndexError):
-        return (
-            "I couldn't reach the model backend just now. Check that Ollama "
-            "is running locally, or that GROQ_API_KEY is set, then try again."
-        )
+        return await _complete(message, system=system, timeout=30.0)
+    except Exception as e:
+        return f"Unable to reach AI backend: {e}"
 
 
 CHAT_ENTITY_EXTRACTION_SYSTEM_PROMPT = """You are a clinical entity extraction assistant. \

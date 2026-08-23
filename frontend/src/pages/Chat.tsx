@@ -151,14 +151,14 @@ export default function Chat() {
   }
 
   return (
-    <div className="flex h-dvh flex-col overflow-hidden">
+    <div className="flex h-dvh max-w-full flex-col overflow-hidden">
       <PageHeader
         eyebrow="Chat"
         title="Ask MedSys"
         action={<ModelIndicator status={modelStatus} />}
       />
 
-      <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-x-hidden lg:flex-row">
         <SessionList
           sessions={sessions}
           activeId={activeSessionId}
@@ -169,7 +169,8 @@ export default function Chat() {
           onDelete={handleDeleteSession}
         />
 
-        <div className="flex min-h-0 flex-1 flex-col">
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-x-hidden">
+
           <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-5 py-6 sm:px-8">
             <motion.div
               className="mx-auto flex max-w-2xl flex-col gap-6"
@@ -184,7 +185,10 @@ export default function Chat() {
               )}
               {messages.map((message) => (
                 <motion.div key={message.id} variants={item}>
-                  <MessageBubble message={message} />
+                  <MessageBubble
+                    message={message}
+                    onSelectOption={(opt) => handleSend(opt, false)}
+                  />
                 </motion.div>
               ))}
               {sending && (

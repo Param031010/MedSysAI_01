@@ -14,7 +14,18 @@ from app.models import (
     ChatSessionSourcesIn,
     ChatSource,
 )
-from app.services import model_router, rag, supermemory_client, weather, web_search
+from app.services import (
+    ai_graph_builder,
+    med_safety,
+    model_router,
+    quick_options,
+    rag,
+    supermemory_client,
+    symptom_tracker,
+    triage,
+    weather,
+    web_search,
+)
 from app.services.clerk_auth import require_clerk_auth
 from app.services.mock_data import CHAT_SOURCES
 
@@ -95,11 +106,40 @@ async def post_session_message(
     db.chat_messages.insert_one({**user_message})
     await _remember_message(session_id, "user", body.content)
 
+    # 1. Semantic Clinical Triage & Red-Flag Layer
+    triage_result = await triage.eval_triage(body.content)
+    if triage_result.get("is_red_flag"):
+        reason = triage_result.get("red_flag_reason") or "Potential clinical emergency indicator detected."
+        guidance = triage_result.get("escalation_guidance") or "Please seek immediate emergency medical care (call 911 or go to the nearest Emergency Department immediately)."
+        escalation_text = (
+            f"⚠️ **EMERGENCY MEDICAL WARNING**\n\n"
+            f"**Clinical Observation**: {reason}\n\n"
+            f"**Recommended Action**: {guidance}\n\n"
+            f"*Safety Protocol Note: Standard self-care and medication suggestions are suppressed due to high-priority emergency indicators. Please consult an emergency physician without delay.*"
+        )
+        assistant_message = {
+            "id": _new_id("m"),
+            "sessionId": session_id,
+            "role": "assistant",
+            "content": escalation_text,
+            "createdAt": _now(),
+            "isRedFlag": True,
+        }
+        db.chat_messages.insert_one({**assistant_message})
+        await _remember_message(session_id, "assistant", escalation_text)
+
+        update = {"updatedAt": _now()}
+        if is_first_message:
+            update["title"] = body.content[:60]
+        db.chat_sessions.update_one({"id": session_id}, {"$set": update})
+        return assistant_message
+
     search_query = (
         body.content
         if body.deepSearch
         else await model_router.decide_web_search(body.content)
     )
+
     web_sources: list[dict] = []
     if search_query:
         web_sources = await web_search.deep_search(search_query)
@@ -143,7 +183,15 @@ async def post_session_message(
             f"Current Medications: {meds_str}"
         )
 
-    if env_snapshot:
+    # Inject longitudinal patient medical memory
+    memory_block = symptom_tracker.format_medical_memory_block(user_id)
+    if memory_block:
+        context_parts.append(memory_block)
+
+    # Condition Environment & AQI injection on respiratory / allergy queries only
+    respiratory_keywords = ("cough", "breathe", "breathing", "asthma", "allergy", "aqi", "pollution", "air", "throat", "rhinitis", "wheez")
+    is_respiratory_query = any(kw in body.content.lower() for kw in respiratory_keywords)
+    if env_snapshot and is_respiratory_query:
         pollutants_str = ", ".join(
             f"{p['label']}: {p['value']} {p['unit']}"
             for p in env_snapshot.get("pollutants", [])
@@ -160,29 +208,39 @@ async def post_session_message(
         context_text = "\n\n".join(chunk["text"] for chunk in context_chunks)
         context_parts.append(f"[MEDICAL RECORDS & CONVERSATION EXCERPTS]\n{context_text}")
 
-    prompt = body.content
+    user_prompt = body.content
+    system_instructions = (
+        "You are MedSys, a warm, caring, and deeply empathetic personal health companion. "
+        "Speak naturally, like a friendly family doctor.\n\n"
+        "STRICT CONVERSATIONAL RULES:\n"
+        "1. DO NOT RUSH TO TREAT: When a patient reports a symptom (e.g. 'I have a cough'), DO NOT generate medical tables, drug lists, or multi-step treatment guides.\n"
+        "2. ASK 1-2 CLARIFICATION QUESTIONS FIRST: Express warm empathy in 1 short sentence, then ask 1 or 2 focused diagnostic questions to understand their situation better.\n"
+        "3. ULTRA-CONCISE RESPONSE: Keep your response short (STRICTLY UNDER 50 WORDS TOTAL).\n"
+        "4. NO TABLES OR BULLET LISTS: Never output markdown tables or long bullet guides when asking clarification questions."
+    )
+
     if context_parts:
         context_block = "\n\n".join(context_parts)
-        prompt = (
-            "Use the following patient profile, live environmental intelligence, and medical record/history excerpts "
-            "to ground your answer. If environmental factors (e.g. high PM2.5 or humidity) or patient active conditions/medications "
-            "are relevant to the user's question, incorporate personalized guidance naturally.\n\n"
-            f"{context_block}\n\nQuestion: {body.content}"
-        )
+        user_prompt = f"{context_block}\n\nPatient Statement: {body.content}"
 
-    # Extracting entities runs alongside reply generation (not after it) so
-    # the knowledge graph and Profile history/medications build themselves
-    # as you chat without adding latency to the reply you're actually
-    # waiting for.
+    # Concurrently generate reply and extract chat entities
     reply_text, entities = await asyncio.gather(
-        model_router.generate_reply(prompt),
+        model_router.generate_reply(user_prompt, system=system_instructions),
         model_router.extract_chat_entities(body.content),
     )
+
+
+    # Generate interactive quick-reply option chips if applicable
+    opts = await quick_options.generate_quick_options(body.content, reply_text)
+
     today = _now()[:10]
     for symptom in entities["symptoms"]:
         try:
-            await supermemory_client.log_symptom(symptom, today)
-        except httpx.HTTPError:
+            normalized_symptom = await ai_graph_builder.normalize_symptom_name(symptom)
+            await supermemory_client.log_symptom(normalized_symptom, today)
+            symptom_tracker.update_symptom_state(user_id, normalized_symptom, status="active")
+            asyncio.create_task(ai_graph_builder.compute_and_store_symptom_knowledge(normalized_symptom))
+        except Exception:
             pass
     for medication in entities["medications"]:
         try:
@@ -196,8 +254,10 @@ async def post_session_message(
         "role": "assistant",
         "content": reply_text,
         "createdAt": _now(),
+        **({"quickOptions": opts} if opts else {}),
     }
     db.chat_messages.insert_one({**assistant_message})
+
     await _remember_message(session_id, "assistant", reply_text)
 
     update = {"updatedAt": _now()}

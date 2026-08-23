@@ -67,6 +67,8 @@ class ChatMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: str
     createdAt: str
+    isRedFlag: bool | None = None
+    quickOptions: list[str] | None = None
 
 
 class ChatSession(BaseModel):

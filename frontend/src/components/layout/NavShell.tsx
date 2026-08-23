@@ -59,9 +59,10 @@ export function NavShell() {
           </div>
         </aside>
 
-        <main className="flex-1 pb-24 lg:pb-0">
+        <main className="flex-1 min-w-0 overflow-x-hidden pb-24 lg:pb-0">
           <Outlet />
         </main>
+
       </div>
 
       <nav

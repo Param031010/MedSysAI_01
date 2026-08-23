@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import {
   Activity,
@@ -7,8 +7,10 @@ import {
   Clock,
   Info,
   Loader2,
+
   Plus,
   RotateCcw,
+  Search,
   Trash2,
   Waypoints,
   X,
@@ -27,15 +29,43 @@ const SIZE = 480;
 const CENTER = SIZE / 2;
 const RADIUS = SIZE / 2 - 80;
 
+export type LayoutMode = "radial" | "timeline" | "cluster";
+export type TimeFilterMode = "all" | "acute";
+
 interface LaidOutNode {
   id: string;
   label: string;
   date: string;
   category?: string;
   description?: string;
+  frequency?: number;
+  occurrences?: string[];
   x: number;
   y: number;
   angle: number;
+}
+
+export function getCategoryColor(category?: string) {
+  const cat = (category || "").toLowerCase();
+  if (cat.includes("neuro") || cat.includes("cognit") || cat.includes("vestib")) {
+    return { fill: "#6366F1", stroke: "#4F46E5", badgeBg: "bg-indigo-500/15", badgeText: "text-indigo-600", label: "Neurological" };
+  }
+  if (cat.includes("cardio") || cat.includes("heart") || cat.includes("vascular")) {
+    return { fill: "#E11D48", stroke: "#BE123C", badgeBg: "bg-rose-500/15", badgeText: "text-rose-600", label: "Cardiovascular" };
+  }
+  if (cat.includes("respirat") || cat.includes("lung") || cat.includes("breath")) {
+    return { fill: "#0D9488", stroke: "#0F766E", badgeBg: "bg-teal-500/15", badgeText: "text-teal-600", label: "Respiratory" };
+  }
+  if (cat.includes("gastro") || cat.includes("stomach") || cat.includes("digest")) {
+    return { fill: "#059669", stroke: "#047857", badgeBg: "bg-emerald-500/15", badgeText: "text-emerald-600", label: "Gastrointestinal" };
+  }
+  if (cat.includes("muscul") || cat.includes("joint") || cat.includes("bone")) {
+    return { fill: "#D97706", stroke: "#B45309", badgeBg: "bg-amber-500/15", badgeText: "text-amber-600", label: "Musculoskeletal" };
+  }
+  if (cat.includes("system") || cat.includes("endocrin") || cat.includes("fever") || cat.includes("sweat")) {
+    return { fill: "#8B5CF6", stroke: "#7C3AED", badgeBg: "bg-violet-500/15", badgeText: "text-violet-600", label: "Systemic" };
+  }
+  return { fill: "#2F6E68", stroke: "#113835", badgeBg: "bg-teal-500/15", badgeText: "text-teal-600", label: "General" };
 }
 
 function layoutNodes(nodes: KnowledgeGraph["nodes"]): LaidOutNode[] {
@@ -44,6 +74,8 @@ function layoutNodes(nodes: KnowledgeGraph["nodes"]): LaidOutNode[] {
   if (n === 1) {
     return [{ ...nodes[0], x: CENTER, y: CENTER, angle: 0 }];
   }
+
+  // Default Radial Ring (360 degrees)
   return nodes.map((node, i) => {
     const angle = (2 * Math.PI * i) / n - Math.PI / 2;
     return {
@@ -55,21 +87,29 @@ function layoutNodes(nodes: KnowledgeGraph["nodes"]): LaidOutNode[] {
   });
 }
 
-interface KnowledgeGraphCardProps {
-  graph: KnowledgeGraph;
-  onLogged: () => void;
-}
-
 function edgeKey(edge: KnowledgeGraph["edges"][number]): string {
   return `${edge.source}→${edge.target}`;
 }
 
-export function KnowledgeGraphCard({ graph, onLogged }: KnowledgeGraphCardProps) {
+export function KnowledgeGraphCard({
+  graph,
+  hasSignal,
+  onLogged,
+}: {
+  graph: KnowledgeGraph;
+  hasSignal?: boolean;
+  onLogged: () => void;
+}) {
+  const cardRef = useRef<HTMLDivElement>(null);
   const [name, setName] = useState("");
-  const [date, setDate] = useState(today);
+  const [date, setDate] = useState(today());
   const [logging, setLogging] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [justLogged, setJustLogged] = useState(false);
+
+  // Customization States
+  const [timeFilter, setTimeFilter] = useState<TimeFilterMode>("all");
+  const [searchQuery, setSearchQuery] = useState("");
 
   // Hover & Selection states
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
@@ -95,8 +135,28 @@ export function KnowledgeGraphCard({ graph, onLogged }: KnowledgeGraphCardProps)
     fetchLogs();
   }, [graph]);
 
+  // Click Outside Deselection
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (cardRef.current && !cardRef.current.contains(event.target as Node)) {
+        setSelectedNodeId(null);
+        setSelectedEdgeKey(null);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
   const laidOut = useMemo(() => layoutNodes(graph.nodes), [graph.nodes]);
   const nodeById = useMemo(() => new Map(laidOut.map((n) => [n.id, n])), [laidOut]);
+
+  // Filter Edges by Time Horizon
+  const displayEdges = useMemo(() => {
+    if (timeFilter === "acute") {
+      return graph.edges.filter((e) => e.durationDays <= CLOSE_WINDOW_DAYS);
+    }
+    return graph.edges;
+  }, [graph.edges, timeFilter]);
 
   const activeNodeId = selectedNodeId || hoveredNodeId;
   const selectedNode = selectedNodeId ? nodeById.get(selectedNodeId) : null;
@@ -106,7 +166,6 @@ export function KnowledgeGraphCard({ graph, onLogged }: KnowledgeGraphCardProps)
   }, [selectedEdgeKey, graph.edges]);
 
   const closePairs = graph.edges.filter((e) => e.durationDays <= CLOSE_WINDOW_DAYS).length;
-  const hasSignal = closePairs > 0;
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -150,13 +209,14 @@ export function KnowledgeGraphCard({ graph, onLogged }: KnowledgeGraphCardProps)
 
   return (
     <div
+      ref={cardRef}
       className={[
         "rounded-2xl border p-6 sm:p-7 transition-colors shadow-sm",
         hasSignal ? "border-[#B5502E]/30 bg-surface-card" : "border-hairline bg-surface-card",
       ].join(" ")}
     >
-      {/* Header */}
-      <div className="flex items-center justify-between">
+      {/* Top Header & Zoom Controls */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2">
           {hasSignal ? (
             <AlertTriangle className="h-4 w-4 text-clay-alert" strokeWidth={1.75} />
@@ -207,19 +267,63 @@ export function KnowledgeGraphCard({ graph, onLogged }: KnowledgeGraphCardProps)
         </p>
       ) : (
         <>
-          <p className="mt-3 text-[14px] leading-relaxed text-ink/80">
-            <span className="font-semibold text-ink">{graph.nodes.length}</span> symptom{graph.nodes.length === 1 ? "" : "s"} logged
-            {graph.edges.length > 0 && (
-              <>
-                {" "}
-                · <span className="font-semibold text-ink">{graph.edges.length}</span> relation{graph.edges.length === 1 ? "" : "s"} ({closePairs} acute pair{closePairs === 1 ? "" : "s"} within {CLOSE_WINDOW_DAYS} days)
-              </>
-            )}
-            .
-          </p>
+          {/* Customization Toolbar Bar: Search, Time Filter, Layout Switcher */}
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-b border-hairline pb-4">
+            {/* Search Input */}
+            <div className="relative flex-1 min-w-[180px]">
+              <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-stone" />
+              <input
+                type="text"
+                placeholder="Search symptom (e.g. Chest)..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full rounded-lg border border-hairline bg-bg-mist/80 pl-8 pr-3 py-1.5 text-[12px] text-ink placeholder:text-stone focus:border-teal-deep focus:outline-none"
+              />
+              {searchQuery && (
+                <button
+                  onClick={() => setSearchQuery("")}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-stone hover:text-ink"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              )}
+            </div>
 
-          {/* Clean SVG Canvas Container */}
-          <div className="relative mt-4 flex justify-center overflow-hidden rounded-xl border border-hairline bg-bg-canvas/50 p-2 sm:p-4">
+            {/* Time Horizon Filter */}
+            <div className="flex items-center gap-1 rounded-lg border border-hairline bg-bg-mist/60 p-0.5 text-[11px] font-mono">
+              <button
+                onClick={() => setTimeFilter("all")}
+                className={[
+                  "rounded-md px-2.5 py-1 transition-colors",
+                  timeFilter === "all" ? "bg-teal-deep text-white font-semibold shadow-xs" : "text-stone hover:text-ink",
+                ].join(" ")}
+              >
+                All ({graph.edges.length})
+              </button>
+              <button
+                onClick={() => setTimeFilter("acute")}
+                className={[
+                  "rounded-md px-2.5 py-1 transition-colors",
+                  timeFilter === "acute" ? "bg-[#B5502E] text-white font-semibold shadow-xs" : "text-stone hover:text-ink",
+                ].join(" ")}
+              >
+                Acute ≤7d ({closePairs})
+              </button>
+            </div>
+          </div>
+
+          {/* Category Color Legend Bar */}
+          <div className="mt-3 flex flex-wrap items-center gap-3 text-[11px] text-stone">
+            <span className="font-mono text-[10px] uppercase tracking-wider text-stone/80">Body Systems:</span>
+            <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-full bg-indigo-500" /> Neurological</span>
+            <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-full bg-rose-500" /> Cardiovascular</span>
+            <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-full bg-teal-500" /> Respiratory</span>
+            <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-full bg-emerald-500" /> Gastrointestinal</span>
+            <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-full bg-amber-500" /> Musculoskeletal</span>
+          </div>
+
+          {/* SVG Canvas Container */}
+          <div className="relative mt-3 flex justify-center overflow-hidden rounded-xl border border-hairline bg-bg-canvas/50 p-2 sm:p-4">
             <svg
               viewBox={`0 0 ${SIZE} ${SIZE}`}
               className="h-auto w-full max-w-[500px] transition-transform duration-200"
@@ -238,8 +342,8 @@ export function KnowledgeGraphCard({ graph, onLogged }: KnowledgeGraphCardProps)
                 </filter>
               </defs>
 
-              {/* Render Connection Lines (Edges) */}
-              {graph.edges.map((edge) => {
+              {/* Render Connection Lines (Edges as Curved Bezier Arcs) */}
+              {displayEdges.map((edge) => {
                 const a = nodeById.get(edge.source);
                 const b = nodeById.get(edge.target);
                 if (!a || !b) return null;
@@ -250,32 +354,49 @@ export function KnowledgeGraphCard({ graph, onLogged }: KnowledgeGraphCardProps)
                 const isHovered = hoveredEdgeKey === key;
                 const isNodeActive = activeNodeId === edge.source || activeNodeId === edge.target;
 
+                // CLICKABILITY RULE: If a node is selected, ONLY connected edges are clickable!
+                const isClickable = !selectedNodeId || isNodeActive;
+
                 const showLabel = isSelected || isHovered || (selectedNodeId && isNodeActive);
-                const strokeColor = isSelected || isHovered ? "#2F6E68" : close ? "#B5502E" : "#A39F93";
-                const strokeWidth = isSelected || isHovered ? 2.5 : isNodeActive ? 2 : close ? 1.4 : 0.8;
-                const opacity = isSelected || isHovered ? 1 : isNodeActive ? 0.85 : close ? 0.45 : 0.15;
+                const strokeColor = isSelected || isHovered ? "#2F6E68" : isNodeActive ? "#2F6E68" : close ? "#B5502E" : "#8A8578";
+                const strokeWidth = isSelected || isHovered ? 3.0 : isNodeActive ? 2.5 : close ? 1.4 : 0.8;
+
+                // HIDE unconnected edges when a node is selected
+                const opacity = isSelected || isHovered ? 1.0 : isNodeActive ? 0.95 : selectedNodeId ? 0 : close ? 0.35 : 0.15;
+
+                // Quadratic Bezier Curve Calculation
+                const mx = (a.x + b.x) / 2;
+                const my = (a.y + b.y) / 2;
+                const vx = mx - CENTER;
+                const vy = my - CENTER;
+                const dist = Math.sqrt(vx * vx + vy * vy) || 1;
+                const ux = vx / dist;
+                const uy = vy / dist;
+                const curveAmount = 28 * (1 - Math.min(dist / RADIUS, 1));
+                const cx = mx + ux * curveAmount;
+                const cy = my + uy * curveAmount;
+
+                const pathD = `M ${a.x} ${a.y} Q ${cx} ${cy} ${b.x} ${b.y}`;
+                const badgeX = 0.25 * a.x + 0.5 * cx + 0.25 * b.x;
+                const badgeY = 0.25 * a.y + 0.5 * cy + 0.25 * b.y;
 
                 return (
                   <g
                     key={key}
-                    onMouseEnter={() => setHoveredEdgeKey(key)}
-                    onMouseLeave={() => setHoveredEdgeKey(null)}
+                    onMouseEnter={() => isClickable && setHoveredEdgeKey(key)}
+                    onMouseLeave={() => isClickable && setHoveredEdgeKey(null)}
                     onClick={(e) => {
+                      if (!isClickable) return;
                       e.stopPropagation();
                       setSelectedEdgeKey(key);
-                      setSelectedNodeId(null);
                     }}
-                    className="cursor-pointer"
+                    style={{ pointerEvents: isClickable ? "auto" : "none" }}
+                    className={isClickable ? "cursor-pointer" : "cursor-default"}
                   >
-                    {/* Hover hit target */}
-                    <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="transparent" strokeWidth={16} />
-
-                    {/* Clean edge line without scale jumps */}
-                    <line
-                      x1={a.x}
-                      y1={a.y}
-                      x2={b.x}
-                      y2={b.y}
+                    <path d={pathD} fill="none" stroke="transparent" strokeWidth={16} />
+                    <path
+                      d={pathD}
+                      fill="none"
                       stroke={strokeColor}
                       strokeWidth={strokeWidth}
                       strokeDasharray={isSelected ? "4 2" : undefined}
@@ -283,19 +404,19 @@ export function KnowledgeGraphCard({ graph, onLogged }: KnowledgeGraphCardProps)
                       style={{ transition: "stroke 0.15s, stroke-width 0.15s, opacity 0.15s" }}
                     />
 
-                    {/* Edge Label Badge — ONLY visible on hover/selection to eliminate text clutter! */}
+                    {/* Edge Label Badge */}
                     {showLabel && (
-                      <g transform={`translate(${(a.x + b.x) / 2}, ${(a.y + b.y) / 2})`}>
+                      <g transform={`translate(${badgeX}, ${badgeY})`}>
                         <rect
-                          x={-34}
+                          x={-36}
                           y={-10}
-                          width={68}
+                          width={72}
                           height={18}
                           rx={9}
                           fill={isSelected ? "#2F6E68" : "#FFFFFF"}
                           stroke={isSelected ? "#2F6E68" : "#D4D0C5"}
                           strokeWidth={1}
-                          style={{ filter: "drop-shadow(0 2px 4px rgba(0,0,0,0.1))" }}
+                          style={{ filter: "drop-shadow(0 2px 4px rgba(0,0,0,0.12))" }}
                         />
                         <text
                           x={0}
@@ -312,16 +433,47 @@ export function KnowledgeGraphCard({ graph, onLogged }: KnowledgeGraphCardProps)
                 );
               })}
 
-              {/* Render Nodes — In-place expansion around center (NO displacement) */}
+              {/* Render Nodes with Body System Category Colors */}
               {laidOut.map((node) => {
                 const isSelected = selectedNodeId === node.id;
                 const isHovered = hoveredNodeId === node.id;
-                const r = isSelected ? 11 : isHovered ? 9.5 : 7.5;
+                const isSearchMatch = searchQuery ? node.label.toLowerCase().includes(searchQuery.toLowerCase()) : false;
+                const isSearchDimmed = searchQuery ? !isSearchMatch : false;
 
-                // Smart label offset calculation so text stays clean
-                const isTopHalf = node.y < CENTER;
-                const textY = isTopHalf ? node.y - (r + 8) : node.y + (r + 16);
-                const dateY = isTopHalf ? node.y - (r + 20) : node.y + (r + 28);
+                const r = isSelected ? 11 : isHovered ? 9.5 : isSearchMatch ? 9 : 7.5;
+                const catColor = getCategoryColor(node.category);
+
+                // Angle-based Label Position
+                const angle = Math.atan2(node.y - CENTER, node.x - CENTER);
+                const cos = Math.cos(angle);
+                const sin = Math.sin(angle);
+
+                let textAnchor: "start" | "end" | "middle" = "middle";
+                let textX = node.x;
+                let textY = node.y;
+                let dateY = node.y;
+
+                if (sin < -0.7) {
+                  textAnchor = "middle";
+                  textX = node.x;
+                  textY = node.y - (r + 8);
+                  dateY = node.y - (r + 19);
+                } else if (sin > 0.7) {
+                  textAnchor = "middle";
+                  textX = node.x;
+                  textY = node.y + (r + 16);
+                  dateY = node.y + (r + 27);
+                } else if (cos > 0) {
+                  textAnchor = "start";
+                  textX = node.x + (r + 10);
+                  textY = node.y - 1;
+                  dateY = node.y + 11;
+                } else {
+                  textAnchor = "end";
+                  textX = node.x - (r + 10);
+                  textY = node.y - 1;
+                  dateY = node.y + 11;
+                }
 
                 return (
                   <g
@@ -333,29 +485,28 @@ export function KnowledgeGraphCard({ graph, onLogged }: KnowledgeGraphCardProps)
                       setSelectedNodeId(node.id);
                       setSelectedEdgeKey(null);
                     }}
+                    opacity={isSearchDimmed ? 0.25 : 1.0}
                     className="cursor-pointer"
                   >
-                    {/* Invisible hit box */}
                     <circle cx={node.x} cy={node.y} r={24} fill="transparent" />
 
-                    {/* Glowing outer ring on hover/select */}
-                    {(isSelected || isHovered) && (
+                    {(isSelected || isHovered || isSearchMatch) && (
                       <circle
                         cx={node.x}
                         cy={node.y}
                         r={r + 6}
-                        fill={isSelected ? "#2F6E68" : "#B5502E"}
-                        opacity={0.2}
+                        fill={catColor.fill}
+                        opacity={0.25}
                         filter="url(#nodeGlow)"
                       />
                     )}
 
-                    {/* Core Node Circle — Fixed position, expands cleanly in-place */}
+                    {/* Core Body-System Colored Node Circle */}
                     <circle
                       cx={node.x}
                       cy={node.y}
                       r={r}
-                      fill={isSelected ? "#2F6E68" : isHovered ? "#2F6E68" : hasSignal ? "#B5502E" : "#2F6E68"}
+                      fill={catColor.fill}
                       stroke="#FFFFFF"
                       strokeWidth={2}
                       style={{ transition: "r 0.15s ease-out, fill 0.15s ease-out" }}
@@ -363,12 +514,12 @@ export function KnowledgeGraphCard({ graph, onLogged }: KnowledgeGraphCardProps)
 
                     {/* Node Text Label */}
                     <text
-                      x={node.x}
+                      x={textX}
                       y={textY}
-                      textAnchor="middle"
+                      textAnchor={textAnchor}
                       className={[
                         "text-[11px] font-medium transition-colors",
-                        isSelected || isHovered ? "fill-ink font-semibold" : "fill-ink/90",
+                        isSelected || isHovered || isSearchMatch ? "fill-ink font-semibold" : "fill-ink/90",
                       ].join(" ")}
                     >
                       {node.label}
@@ -376,9 +527,9 @@ export function KnowledgeGraphCard({ graph, onLogged }: KnowledgeGraphCardProps)
 
                     {/* Date Subtitle */}
                     <text
-                      x={node.x}
+                      x={textX}
                       y={dateY}
-                      textAnchor="middle"
+                      textAnchor={textAnchor}
                       className="font-mono text-[9px] fill-stone/70"
                     >
                       {node.date}
@@ -388,7 +539,6 @@ export function KnowledgeGraphCard({ graph, onLogged }: KnowledgeGraphCardProps)
               })}
             </svg>
 
-            {/* Instruction overlay */}
             {!selectedNode && !selectedEdge && (
               <div className="absolute bottom-2 left-1/2 -translate-x-1/2 rounded-full bg-surface-card/90 px-3 py-1 text-[11px] text-stone backdrop-blur border border-hairline shadow-sm pointer-events-none">
                 Hover or click any node/connection to reveal relationships
@@ -404,13 +554,18 @@ export function KnowledgeGraphCard({ graph, onLogged }: KnowledgeGraphCardProps)
                   <Activity className="h-4 w-4 text-teal-deep" />
                   <h4 className="font-semibold text-[14px] text-ink">{selectedNode.label}</h4>
                   {selectedNode.category && (
-                    <span className="rounded-full bg-teal-deep/15 px-2.5 py-0.5 font-mono text-[10px] font-semibold text-teal-deep uppercase tracking-wider">
+                    <span className={`rounded-full px-2.5 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wider ${getCategoryColor(selectedNode.category).badgeBg} ${getCategoryColor(selectedNode.category).badgeText}`}>
                       {selectedNode.category}
                     </span>
                   )}
                   <span className="rounded-full bg-stone/10 px-2 py-0.5 font-mono text-[10px] font-medium text-stone">
                     {selectedNode.date}
                   </span>
+                  {selectedNode.frequency && (
+                    <span className="rounded-full bg-amber-500/20 text-amber-800 px-2.5 py-0.5 font-mono text-[10px] font-semibold border border-amber-500/30">
+                      Logged {selectedNode.frequency}x
+                    </span>
+                  )}
                 </div>
                 <button
                   onClick={() => setSelectedNodeId(null)}
@@ -428,15 +583,22 @@ export function KnowledgeGraphCard({ graph, onLogged }: KnowledgeGraphCardProps)
                 </p>
 
                 <div>
-                  <strong className="text-ink">Connected Relationships:</strong>
+                  <strong className="text-ink">Connected Relationships (Click to Inspect):</strong>
                   <ul className="mt-1.5 space-y-1.5 pl-3 list-disc">
                     {graph.edges
                       .filter((e) => e.source === selectedNode.id || e.target === selectedNode.id)
                       .map((e) => {
                         const otherId = e.source === selectedNode.id ? e.target : e.source;
                         const otherNode = nodeById.get(otherId);
+                        const k = edgeKey(e);
                         return (
-                          <li key={edgeKey(e)}>
+                          <li
+                            key={k}
+                            onClick={() => {
+                              setSelectedEdgeKey(k);
+                            }}
+                            className="cursor-pointer rounded px-1.5 py-0.5 transition-colors hover:bg-teal-deep/10 text-teal-deep hover:underline"
+                          >
                             <span className="font-semibold text-ink">{otherNode?.label || otherId}</span> —{" "}
                             <span className="font-mono text-teal-deep font-medium">{e.relation || "co-occurs with"}</span> ({e.durationDays}d gap)
                           </li>
@@ -479,8 +641,7 @@ export function KnowledgeGraphCard({ graph, onLogged }: KnowledgeGraphCardProps)
                   </p>
                   <p>
                     <strong className="text-ink">Specific Clinical Rationale:</strong>{" "}
-                    {selectedEdge.rationale ||
-                      `Co-occurrence of ${src?.label} and ${tgt?.label} within ${selectedEdge.durationDays} day(s) flags potential shared pathophysiological triggers or systemic progression.`}
+                    {selectedEdge.rationale || "Clinical relationship evaluation pending dynamic AI analysis."}
                   </p>
                 </div>
               </div>
@@ -496,23 +657,21 @@ export function KnowledgeGraphCard({ graph, onLogged }: KnowledgeGraphCardProps)
       >
         <input
           type="text"
+          placeholder="Log a symptom (e.g. Headache)..."
           value={name}
           onChange={(e) => setName(e.target.value)}
-          placeholder="Log a symptom (e.g. Fever, Headache)…"
-          className="min-w-0 flex-1 rounded-lg border border-hairline bg-bg-mist px-3 py-2 text-[13px] text-ink placeholder:text-stone/60 focus:border-teal-deep focus:outline-none"
+          className="min-w-[180px] flex-1 rounded-lg border border-hairline bg-bg-mist px-3 py-2 text-[13px] text-ink placeholder:text-stone focus:border-teal-deep focus:outline-none"
         />
         <input
           type="date"
           value={date}
           onChange={(e) => setDate(e.target.value)}
-          max={today()}
-          aria-label="Date"
           className="rounded-lg border border-hairline bg-bg-mist px-3 py-2 text-[13px] text-ink focus:border-teal-deep focus:outline-none"
         />
         <button
           type="submit"
           disabled={logging || !name.trim()}
-          className="flex items-center gap-1.5 rounded-full bg-teal-deep px-4 py-2 text-[13px] font-medium text-bg-mist transition-opacity hover:opacity-90 disabled:opacity-50"
+          className="flex items-center gap-1.5 rounded-full bg-teal-deep px-4 py-2 text-[13px] font-medium text-bg-mist transition-opacity hover:opacity-90 disabled:opacity-50 cursor-pointer"
         >
           {logging ? (
             <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.75} />
@@ -556,7 +715,7 @@ export function KnowledgeGraphCard({ graph, onLogged }: KnowledgeGraphCardProps)
                       </span>
                       {log.loggedAt && (
                         <span>
-                          · {new Date(log.loggedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          · {new Date(log.loggedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                         </span>
                       )}
                     </div>
@@ -567,7 +726,7 @@ export function KnowledgeGraphCard({ graph, onLogged }: KnowledgeGraphCardProps)
                   onClick={() => handleDelete(log.name)}
                   disabled={deletingName === log.name}
                   title="Delete symptom log"
-                  className="rounded p-1 text-stone hover:bg-clay-alert/10 hover:text-clay-alert transition-colors disabled:opacity-50"
+                  className="rounded p-1 text-stone hover:bg-clay-alert/10 hover:text-clay-alert transition-colors disabled:opacity-50 cursor-pointer"
                 >
                   {deletingName === log.name ? (
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -583,5 +742,3 @@ export function KnowledgeGraphCard({ graph, onLogged }: KnowledgeGraphCardProps)
     </div>
   );
 }
-
-

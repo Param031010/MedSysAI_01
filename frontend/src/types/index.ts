@@ -80,6 +80,8 @@ export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   createdAt: string;
+  isRedFlag?: boolean;
+  quickOptions?: string[];
 }
 
 export interface ModelStatus {

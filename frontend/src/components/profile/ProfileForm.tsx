@@ -1,7 +1,7 @@
 import { useState } from "react";
 import type { FormEvent } from "react";
-import { Plus, X } from "lucide-react";
 import type { ProfileRecord } from "@/types";
+
 import type { ProfileInput } from "@/services/profile";
 
 const BLOOD_GROUPS = ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"];
@@ -181,9 +181,11 @@ export function ProfileForm({ initial, saving, error, onCancel, onSave }: Profil
             <button
               type="button"
               onClick={() => update("conditions", [...form.conditions, ""])}
-              className="flex items-center gap-1 text-[12px] text-teal-deep hover:opacity-80"
+              className="flex items-center gap-1 text-[12px] text-teal-deep hover:opacity-80 font-medium"
             >
-              <Plus className="h-3.5 w-3.5" strokeWidth={2} />
+              <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+              </svg>
               Add condition
             </button>
           </div>
@@ -212,9 +214,11 @@ export function ProfileForm({ initial, saving, error, onCancel, onSave }: Profil
                       )
                     }
                     aria-label="Remove condition"
-                    className="shrink-0 text-stone hover:text-clay-alert"
+                    className="shrink-0 text-stone hover:text-clay-alert p-1"
                   >
-                    <X className="h-4 w-4" strokeWidth={1.75} />
+                    <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                    </svg>
                   </button>
                 </div>
               ))}
@@ -232,9 +236,11 @@ export function ProfileForm({ initial, saving, error, onCancel, onSave }: Profil
               onClick={() =>
                 update("medications", [...form.medications, { name: "", dosage: "" }])
               }
-              className="flex items-center gap-1 text-[12px] text-teal-deep hover:opacity-80"
+              className="flex items-center gap-1 text-[12px] text-teal-deep hover:opacity-80 font-medium"
             >
-              <Plus className="h-3.5 w-3.5" strokeWidth={2} />
+              <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+              </svg>
               Add medication
             </button>
           </div>
@@ -273,14 +279,17 @@ export function ProfileForm({ initial, saving, error, onCancel, onSave }: Profil
                       )
                     }
                     aria-label="Remove medication"
-                    className="shrink-0 text-stone hover:text-clay-alert"
+                    className="shrink-0 text-stone hover:text-clay-alert p-1"
                   >
-                    <X className="h-4 w-4" strokeWidth={1.75} />
+                    <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                    </svg>
                   </button>
                 </div>
               ))}
             </div>
           )}
+
         </section>
       </div>
 

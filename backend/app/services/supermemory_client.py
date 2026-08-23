@@ -7,6 +7,8 @@ connects them as a complete graph, each edge labeled with the number of
 days between the two symptoms' occurrences.
 """
 
+import asyncio
+import re
 from datetime import datetime
 
 import httpx
@@ -29,30 +31,52 @@ def _format_date(iso_date: str) -> str:
     return f"{d.strftime('%a, %b')} {d.day}"
 
 
-async def log_symptom(name: str, occurred_on: str) -> None:
+async def log_symptom(name: str, occurred_on: str) -> dict:
     db = get_db()
+    cleaned_name = name.strip()
+    key_name = cleaned_name.lower()
+
+    existing = db.symptoms.find_one({"name": {"$regex": f"^{re.escape(cleaned_name)}$", "$options": "i"}})
+    current_freq = (existing.get("frequency", 1) + 1) if existing else 1
+    occurrences = list(existing.get("occurrences", [])) if existing else []
+    if occurred_on not in occurrences:
+        occurrences.append(occurred_on)
+
     db.symptoms.update_one(
-        {"name": name.strip().lower()},
-        {"$set": {"name": name.strip(), "date": occurred_on, "loggedAt": datetime.now().isoformat()}},
+        {"name": {"$regex": f"^{re.escape(cleaned_name)}$", "$options": "i"}},
+        {
+            "$set": {
+                "name": cleaned_name,
+                "date": occurred_on,
+                "loggedAt": datetime.now().isoformat(),
+                "frequency": current_freq,
+                "occurrences": occurrences,
+            }
+        },
         upsert=True,
     )
-    if not settings.supermemory_api_key:
-        return
-    payload = {
-        "memories": [
-            {
-                "content": f"Patient reported symptom '{name}' on {occurred_on}.",
-                "metadata": {"type": "symptom", "symptom": name, "date": occurred_on},
-                "temporalContext": {"eventDate": [occurred_on]},
-            }
-        ],
-        "containerTag": settings.supermemory_container_tag,
-    }
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        res = await client.post(
-            f"{SUPERMEMORY_BASE}/v4/memories", headers=_headers(), json=payload
-        )
-        res.raise_for_status()
+    if settings.supermemory_api_key:
+        async def _sync_supermemory():
+            try:
+                payload = {
+                    "memories": [
+                        {
+                            "content": f"Patient reported symptom '{cleaned_name}' on {occurred_on}. Frequency: {current_freq}.",
+                            "metadata": {"type": "symptom", "symptom": cleaned_name, "date": occurred_on, "frequency": current_freq},
+                            "temporalContext": {"eventDate": [occurred_on]},
+                        }
+                    ],
+                    "containerTag": settings.supermemory_container_tag,
+                }
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    await client.post(
+                        f"{SUPERMEMORY_BASE}/v4/memories", headers=_headers(), json=payload
+                    )
+            except Exception:
+                pass
+        asyncio.create_task(_sync_supermemory())
+
+    return {"name": cleaned_name, "date": occurred_on, "frequency": current_freq, "occurrences": occurrences}
 
 
 async def delete_symptom(name: str) -> None:
@@ -155,44 +179,9 @@ async def log_chat_message(session_id: str, role: str, content: str) -> None:
 
 
 async def list_all_symptoms() -> list[dict]:
-    """Returns every distinct symptom/condition ever logged, one entry per
-    distinct name with its most recent occurrence date."""
+    """Returns every active symptom stored in MongoDB db.symptoms."""
     db = get_db()
-    local_symptoms = list(db.symptoms.find({}, {"_id": 0}))
-
-    if not settings.supermemory_api_key:
-        return local_symptoms
-
-    try:
-        async with httpx.AsyncClient(timeout=0.5) as client:
-            res = await client.post(
-                f"{SUPERMEMORY_BASE}/v4/search",
-                headers=_headers(),
-                json={
-                    "q": "symptom",
-                    "containerTag": settings.supermemory_container_tag,
-                    "limit": 100,
-                },
-            )
-            res.raise_for_status()
-            results = res.json().get("results", [])
-    except httpx.HTTPError:
-        return local_symptoms
-
-    latest_by_name: dict[str, str] = {s["name"].lower(): s["date"] for s in local_symptoms if "name" in s and "date" in s}
-    for r in results:
-        meta = r.get("metadata")
-        if not isinstance(meta, dict) or meta.get("type") != "symptom":
-            continue
-        name = meta.get("symptom")
-        date = meta.get("date")
-        if not name or not date:
-            continue
-        key = name.lower()
-        if key not in latest_by_name or date > latest_by_name[key]:
-            latest_by_name[key] = date
-    return [{"name": name, "date": date} for name, date in latest_by_name.items()]
-
+    return list(db.symptoms.find({}, {"_id": 0}))
 
 
 async def list_all_medications() -> list[dict]:
@@ -297,7 +286,13 @@ async def build_graph() -> dict:
     symptoms = await list_all_symptoms()
 
     nodes = [
-        {"id": f"n{i}", "label": s["name"].capitalize(), "date": _format_date(s["date"])}
+        {
+            "id": f"n{i}",
+            "label": s["name"].capitalize(),
+            "date": _format_date(s["date"]),
+            "frequency": s.get("frequency", 1),
+            "occurrences": s.get("occurrences", [s.get("date", "")]),
+        }
         for i, s in enumerate(symptoms)
     ]
 

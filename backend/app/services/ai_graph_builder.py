@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 from datetime import datetime
@@ -41,6 +42,63 @@ Reply ONLY with a JSON object of this exact shape:
   "edges": [{"source": "n1", "target": "n2", "relation": "...", "rationale": "..."}]
 }"""
 
+NORMALIZATION_SYSTEM_PROMPT = """You are a senior clinical terminology expert AI.
+Your job is to convert ANY patient phrase or descriptive sentence into ONLY its concise, 1-3 word standardized clinical medical term name. Do NOT repeat the patient sentence or descriptive words.
+
+Examples:
+- "my heart beat is very slow I can see it on my watch" -> "Bradycardia"
+- "Slighter Head Pain In The Back Region Of My Head" -> "Occipital Headache"
+- "my chest feels heavy and tight" -> "Chest Pain"
+- "can't sleep at night" -> "Insomnia"
+- "throwing up" -> "Nausea"
+- "feeling dizzy like room is spinning" -> "Dizziness"
+- "Headache" -> "Headache"
+
+Output ONLY the 1-3 word clinical medical term, no preamble, no markdown."""
+
+
+def _clean_think(raw: str) -> str:
+    if not raw:
+        return ""
+    if "</think>" in raw:
+        raw = raw.split("</think>")[-1]
+    elif "<think>" in raw:
+        raw = raw.split("<think>")[-1]
+    lines = [l.strip() for l in raw.split("\n") if l.strip()]
+    if not lines:
+        return ""
+    last = lines[-1]
+    last = re.sub(r"^.*?(?:Result|Output|Term):\s*", "", last, flags=re.I)
+    last = re.sub(r"^[\*\-\d\.\s]+", "", last)
+    last = re.sub(r'["\']', '', last)
+    return last.strip()
+
+
+async def normalize_symptom_name(raw_input: str) -> str:
+    """Uses LLM reasoning to map layperson symptom descriptions to standardized medical terms."""
+    cleaned_input = raw_input.strip()
+    if not cleaned_input:
+        return ""
+
+    try:
+        raw = await model_router.complete_gemini(
+            f"Convert to 1-2 word medical term: '{cleaned_input}'",
+            system=NORMALIZATION_SYSTEM_PROMPT,
+            max_tokens=1500,
+            timeout=25.0,
+            temperature=0,
+        )
+        cleaned = _clean_think(raw)
+        cleaned = re.sub(r"[^\x00-\x7F]+", " ", cleaned)
+        cleaned = re.sub(r"^```\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+        if cleaned and len(cleaned) < 45:
+            return cleaned.title()
+    except Exception:
+        pass
+
+    return cleaned_input.capitalize()
+
 
 def _format_date(iso_date: str) -> str:
     try:
@@ -76,14 +134,19 @@ async def build_llm_knowledge_graph(symptoms: list[dict], conditions: list[str] 
         raw = await model_router.complete_gemini(
             user_prompt,
             system=SYSTEM_PROMPT,
-            max_tokens=600,
-            timeout=3.0,
+            max_tokens=2500,
+            timeout=15.0,
             temperature=0,
         )
+        cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+        cleaned = re.sub(r"^```json\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^```\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+
         try:
-            data = json.loads(raw.strip())
+            data = json.loads(cleaned)
         except json.JSONDecodeError:
-            match = _JSON_OBJECT.search(raw)
+            match = _JSON_OBJECT.search(cleaned)
             if not match:
                 raise ValueError("No JSON object in model response")
             data = json.loads(match.group(0))
@@ -166,6 +229,48 @@ Reply ONLY with a raw JSON object of this exact shape, no preamble, no markdown 
 }"""
 
 
+def apply_cached_knowledge(graph: dict) -> dict:
+    """Fast non-blocking instant MongoDB cache lookup. Applies cached clinical definitions and rationales in 0ms."""
+    if not graph or not graph.get("nodes"):
+        return graph
+
+    db = get_db()
+    nodes = list(graph.get("nodes", []))
+    edges = list(graph.get("edges", []))
+    node_by_id = {n["id"]: n for n in nodes}
+
+    node_keys = [f"node:{n.get('label', '').strip().lower()}" for n in nodes if n.get("label")]
+    edge_key_map = {}
+    for e in edges:
+        s_lbl = node_by_id.get(e["source"], {}).get("label", "").lower()
+        t_lbl = node_by_id.get(e["target"], {}).get("label", "").lower()
+        if s_lbl and t_lbl:
+            e_key = f"edge:{min(s_lbl, t_lbl)}:{max(s_lbl, t_lbl)}"
+            edge_key_map[id(e)] = (e, e_key)
+
+    all_keys = list(set(node_keys + [pair[1] for pair in edge_key_map.values()]))
+    cached_docs = {doc["key"]: doc for doc in db.graph_cache.find({"key": {"$in": all_keys}})}
+
+    for n in nodes:
+        label = n.get("label", "").strip()
+        cached = cached_docs.get(f"node:{label.lower()}")
+        if cached and cached.get("description"):
+            n["description"] = cached.get("description")
+            n["category"] = cached.get("category", "Clinical Symptom")
+
+    for e in edges:
+        s_lbl = node_by_id.get(e["source"], {}).get("label", "").lower()
+        t_lbl = node_by_id.get(e["target"], {}).get("label", "").lower()
+        if s_lbl and t_lbl:
+            e_key = f"edge:{min(s_lbl, t_lbl)}:{max(s_lbl, t_lbl)}"
+            cached = cached_docs.get(e_key)
+            if cached and cached.get("rationale"):
+                e["relation"] = cached.get("relation", e.get("relation"))
+                e["rationale"] = cached.get("rationale")
+
+    return {"nodes": nodes, "edges": edges}
+
+
 async def enrich_graph_with_clinical_knowledge(graph: dict) -> dict:
     """Enriches graph nodes and edges dynamically using Gemini 2.5 Flash with ZERO hardcoded fallback dictionaries. Stores everything permanently in MongoDB db.graph_cache."""
     if not graph or not graph.get("nodes"):
@@ -177,10 +282,23 @@ async def enrich_graph_with_clinical_knowledge(graph: dict) -> dict:
     node_by_id = {n["id"]: n for n in nodes}
     node_by_label = {n["label"].strip().lower(): n for n in nodes if n.get("label")}
 
+    # 1. Batch fetch all node and edge cache keys in ONE single MongoDB query
+    node_keys = [f"node:{n.get('label', '').strip().lower()}" for n in nodes if n.get("label")]
+    edge_key_map = {}
+    for e in edges:
+        s_lbl = node_by_id.get(e["source"], {}).get("label", "").lower()
+        t_lbl = node_by_id.get(e["target"], {}).get("label", "").lower()
+        if s_lbl and t_lbl:
+            e_key = f"edge:{min(s_lbl, t_lbl)}:{max(s_lbl, t_lbl)}"
+            edge_key_map[id(e)] = (e, e_key)
+
+    all_keys = list(set(node_keys + [pair[1] for pair in edge_key_map.values()]))
+    cached_docs = {doc["key"]: doc for doc in db.graph_cache.find({"key": {"$in": all_keys}})}
+
     uncached_nodes = []
     for n in nodes:
         label = n.get("label", "").strip()
-        cached = db.graph_cache.find_one({"key": f"node:{label.lower()}"})
+        cached = cached_docs.get(f"node:{label.lower()}")
         if cached and cached.get("description"):
             n["description"] = cached.get("description")
             n["category"] = cached.get("category", "Clinical Symptom")
@@ -194,55 +312,65 @@ async def enrich_graph_with_clinical_knowledge(graph: dict) -> dict:
         if not src_label or not tgt_label:
             continue
         key = f"edge:{min(src_label, tgt_label).lower()}:{max(src_label, tgt_label).lower()}"
-        cached = db.graph_cache.find_one({"key": key})
+        cached = cached_docs.get(key)
         if cached and cached.get("rationale"):
             e["relation"] = cached.get("relation", e.get("relation"))
             e["rationale"] = cached.get("rationale")
         else:
             uncached_edges.append((e, src_label, tgt_label, key))
 
-    # 1. Dynamically enrich uncached nodes via Gemini 2.5 Flash
+    # 1. Dynamically enrich uncached nodes in parallel 8-item chunks via Gemini 2.5 Flash / Groq
     if uncached_nodes:
-        prompt_lines = ["Define the following patient symptoms:"]
-        for n in uncached_nodes:
-            prompt_lines.append(f"- {n['label']}")
+        node_chunks = [uncached_nodes[i:i + 8] for i in range(0, len(uncached_nodes), 8)]
 
-        try:
-            raw = await model_router.complete_gemini(
-                "\n".join(prompt_lines),
-                system=NODE_SYSTEM_PROMPT,
-                max_tokens=1500,
-                timeout=25.0,
-                temperature=0,
-            )
-            cleaned = re.sub(r"^```json\s*", "", raw.strip(), flags=re.IGNORECASE)
-            cleaned = re.sub(r"^```\s*", "", cleaned)
-            cleaned = re.sub(r"\s*```$", "", cleaned)
-            match = _JSON_OBJECT.search(cleaned)
-            data = json.loads(match.group(0)) if match else json.loads(cleaned)
+        async def _enrich_node_chunk(chunk: list):
+            prompt_lines = ["Define the following patient symptoms:"]
+            for n in chunk:
+                prompt_lines.append(f"- {n['label']}")
 
-            for n_item in data.get("nodes", []):
-                lbl = str(n_item.get("label", "")).strip().lower()
-                target_node = node_by_label.get(lbl)
-                if target_node:
-                    desc = str(n_item.get("description", "")).strip()
-                    cat = str(n_item.get("category", "Clinical Symptom")).strip()
-                    if desc:
-                        target_node["description"] = desc
-                        target_node["category"] = cat
-                        db.graph_cache.update_one(
-                            {"key": f"node:{target_node['label'].lower()}"},
-                            {"$set": {"description": desc, "category": cat}},
-                            upsert=True,
-                        )
-        except Exception:
-            pass
+            try:
+                raw = await model_router.complete_gemini(
+                    "\n".join(prompt_lines),
+                    system=NODE_SYSTEM_PROMPT,
+                    max_tokens=1500,
+                    timeout=25.0,
+                    temperature=0,
+                )
+                cleaned = re.sub(r"^```json\s*", "", raw.strip(), flags=re.IGNORECASE)
+                cleaned = re.sub(r"^```\s*", "", cleaned)
+                cleaned = re.sub(r"\s*```$", "", cleaned)
+                match = _JSON_OBJECT.search(cleaned)
+                data = json.loads(match.group(0)) if match else json.loads(cleaned)
 
-    # 2. Dynamically enrich uncached edges in small 15-pair chunks via Gemini 2.5 Flash
+                for n_item in data.get("nodes", []):
+                    lbl = str(n_item.get("label", "")).strip().lower()
+                    target_node = node_by_label.get(lbl)
+                    if not target_node:
+                        for k, n_obj in node_by_label.items():
+                            if lbl in k or k in lbl:
+                                target_node = n_obj
+                                break
+                    if target_node:
+                        desc = str(n_item.get("description", "")).strip()
+                        cat = str(n_item.get("category", "Clinical Symptom")).strip()
+                        if desc:
+                            target_node["description"] = desc
+                            target_node["category"] = cat
+                            db.graph_cache.update_one(
+                                {"key": f"node:{target_node['label'].lower()}"},
+                                {"$set": {"description": desc, "category": cat}},
+                                upsert=True,
+                            )
+            except Exception:
+                pass
+
+        await asyncio.gather(*(_enrich_node_chunk(c) for c in node_chunks), return_exceptions=True)
+
+    # 2. Dynamically enrich uncached edges in parallel 15-pair chunks via Gemini 2.5 Flash
     if uncached_edges:
         edge_chunks = [uncached_edges[i:i + 15] for i in range(0, len(uncached_edges), 15)]
 
-        for edge_chunk in edge_chunks:
+        async def _enrich_chunk(edge_chunk: list):
             prompt_lines = ["Analyze the clinical relationship for these symptom pairs:"]
             for e, src_label, tgt_label, _ in edge_chunk:
                 prompt_lines.append(f"- Pair: {src_label} and {tgt_label} (Occurred {e.get('durationDays', 0)} days apart)")
@@ -252,7 +380,7 @@ async def enrich_graph_with_clinical_knowledge(graph: dict) -> dict:
                     "\n".join(prompt_lines),
                     system=EDGE_SYSTEM_PROMPT,
                     max_tokens=2000,
-                    timeout=30.0,
+                    timeout=25.0,
                     temperature=0,
                 )
                 cleaned = re.sub(r"^```json\s*", "", raw.strip(), flags=re.IGNORECASE)
@@ -292,6 +420,8 @@ async def enrich_graph_with_clinical_knowledge(graph: dict) -> dict:
             except Exception:
                 pass
 
+        await asyncio.gather(*(_enrich_chunk(c) for c in edge_chunks), return_exceptions=True)
+
     return {"nodes": nodes, "edges": edges}
 
 
@@ -302,7 +432,7 @@ async def compute_and_store_symptom_knowledge(symptom_name: str) -> None:
     if not symptom_name:
         return
 
-    all_symptoms = await db.symptoms.find({}, {"_id": 0}).to_list(length=100)
+    all_symptoms = list(db.symptoms.find({}, {"_id": 0}))
     existing_labels = list({s["name"].strip().capitalize() for s in all_symptoms if s.get("name") and s["name"].strip().capitalize() != symptom_name})
 
     prompt_lines = [
@@ -320,19 +450,20 @@ async def compute_and_store_symptom_knowledge(symptom_name: str) -> None:
             timeout=25.0,
             temperature=0,
         )
-        cleaned = re.sub(r"^```json\s*", "", raw.strip(), flags=re.IGNORECASE)
+        cleaned = re.sub(r"<think>.*?</think>", "", raw.strip(), flags=re.DOTALL).strip()
+        cleaned = re.sub(r"^```json\s*", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"^```\s*", "", cleaned)
         cleaned = re.sub(r"\s*```$", "", cleaned)
         match = _JSON_OBJECT.search(cleaned)
         data = json.loads(match.group(0)) if match else json.loads(cleaned)
 
+        clean_key = f"node:{symptom_name.lower()}"
         for n_item in data.get("nodes", []):
             desc = str(n_item.get("description", "")).strip()
             cat = str(n_item.get("category", "General")).strip()
-            label = str(n_item.get("label", symptom_name)).strip().lower()
             if desc:
                 db.graph_cache.update_one(
-                    {"key": f"node:{label}"},
+                    {"key": clean_key},
                     {"$set": {"description": desc, "category": cat}},
                     upsert=True,
                 )
