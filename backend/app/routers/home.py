@@ -46,9 +46,6 @@ async def get_snapshot() -> dict:
         if general_tip and isinstance(general_tip, str):
             snapshot["generalTip"] = general_tip
 
-        raw_graph = graph if (graph and isinstance(graph, dict) and graph.get("nodes")) else await supermemory_client.build_graph()
-        status, status_note = supermemory_client.describe_status(raw_graph)
-
         enriched_graph = ai_graph_builder.apply_cached_knowledge(raw_graph)
         snapshot["graph"] = enriched_graph
         snapshot["status"] = status

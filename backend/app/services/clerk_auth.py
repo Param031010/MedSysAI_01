@@ -28,12 +28,10 @@ def _get_jwks_client() -> PyJWKClient:
 
 
 async def require_clerk_auth(authorization: str | None = Header(default=None)) -> str:
-    """FastAPI dependency: returns the Clerk user id (`sub` claim) from JWT, or falls back to 'dev_user_01' if unauthenticated."""
+    """FastAPI dependency: returns the Clerk user id (`sub` claim) or raises 401."""
     if not authorization or not authorization.startswith("Bearer "):
-        return "dev_user_01"
+        raise HTTPException(status_code=401, detail="Missing bearer token")
     token = authorization.removeprefix("Bearer ").strip()
-    if not token:
-        return "dev_user_01"
 
     try:
         signing_key = _get_jwks_client().get_signing_key_from_jwt(token)
@@ -43,9 +41,13 @@ async def require_clerk_auth(authorization: str | None = Header(default=None)) -
             algorithms=["RS256"],
             issuer=settings.clerk_issuer,
             options={"require": ["exp", "iat", "sub"]},
+            # Clerk session tokens are short-lived (~60s) — tolerate a bit of
+            # clock skew between this machine and Clerk's servers rather than
+            # rejecting genuinely valid tokens.
             leeway=30,
         )
-        return claims["sub"]
-    except Exception:
-        return "dev_user_01"
+    except jwt.PyJWTError as exc:
+        raise HTTPException(status_code=401, detail=f"Invalid session token: {exc}") from None
+
+    return claims["sub"]
 

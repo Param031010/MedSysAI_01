@@ -176,7 +176,7 @@ async def _complete(
                 res = await client.post(
                     f"{settings.ollama_host}/api/chat",
                     json=ollama_payload,
-                    timeout=1.5,
+                    timeout=timeout,
                 )
                 res.raise_for_status()
                 text = res.json()["message"]["content"]
