@@ -98,7 +98,14 @@ async def _ocr_batch_safe(
         if provider == "ollama":
             return await _ocr_batch_ollama(client, model, batch)
         return await _ocr_batch_groq(client, model, batch)
-    except httpx.HTTPError:
+    except Exception:
+        # Fallback to Groq Cloud vision if local Ollama vision model fails or isn't pulled
+        if provider == "ollama" and settings.groq_api_key:
+            for v_model in ["llama-3.2-11b-vision-preview", settings.groq_vision_model]:
+                try:
+                    return await _ocr_batch_groq(client, v_model, batch)
+                except Exception:
+                    pass
         return ""
 
 
